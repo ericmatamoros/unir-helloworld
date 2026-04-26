@@ -1,56 +1,59 @@
 pipeline {
     agent any
 
-     stages {
+    stages {
         stage('Get Code') {
             steps {
-                // Obtener código del repo
-                git 'https://github.com/anieto-unir/helloworld.git'
+                git 'https://github.com/ericmatamoros/unir-helloworld'
             }
         }
 
-    stage('Build') {
-        steps {
-            echo 'Eyyyy, esto es Python. No hay que compilar nada!!!'
-	    echo WORKSPACE
-	    bat 'dir'
+        stage('Build') {
+            steps {
+                echo 'Eyyy, esto es Python. No hay que compilar nada!!!'
+                echo "${WORKSPACE}"
+                sh 'pwd'
+                sh 'ls -la'
+            }
         }
-    }
-
-    stage('Tests')
-    {
-        parallel {
-
-            stage('Unit') {
-                steps {
-                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                        bat '''
-                                set PYTHONPATH=%WORKSPACE%
-                                pytest --junitxml=result-unit.xml test\\unit
-                        '''
+        
+        stage('Tests') {
+            parallel {
+            
+                stage('Unit') {
+                        steps {
+                            sh '''
+                                source ~/miniconda3/etc/profile.d/conda.sh
+                                conda activate unir
+            
+                                export PYTHONPATH=$WORKSPACE
+                                python -m pytest --junitxml=result-unit.xml test/unit
+                            '''
+                        }
+                }
+                stage('Service') {
+                    steps {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            sh '''
+                                source ~/miniconda3/etc/profile.d/conda.sh
+                                conda activate unir
+                
+                                export FLASK_APP=app/api.py
+                                export FLASK_ENV=development
+                                flask run &
+                
+                                export PYTHONPATH=$WORKSPACE
+                                python -m pytest --junitxml=result-rest.xml test/rest
+                            '''
+                        }
                     }
                 }
             }
-            
-            stage('Rest') {
-                steps {
-                    bat '''
-                        set FLASK_APP=app\\api.py
-                        set FLASK_ENV=development
-                        start flask run
-                        start java -jar C:\\Unir\\Ejercicios\\wiremock\\wiremock-jre8-standalone-2.28.0.jar --port 9090 --root-dir test\\wiremock
-                        set PYTHONPATH=%WORKSPACE%
-                        pytest --junitxml=result-rest.xml test\\rest
-                    '''
-                }    
-            }    
+        }
+        stage('Results') {
+            steps {
+                junit 'result-unit.xml'
+            }
         }
     }
-    
-    stage ('Results') {
-        steps {
-            junit 'result*.xml'
-        }
-    }
-  }
 }
