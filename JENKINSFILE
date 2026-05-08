@@ -1,58 +1,94 @@
 pipeline {
     agent any
-
+    environment {
+        PATH = "${HOME}/miniconda3/envs/unir/bin:${HOME}/miniconda3/condabin:${env.PATH}"
+        CONDA_DEFAULT_ENV = 'unir'
+        CONDA_PREFIX = "${HOME}/miniconda3/envs/unir"
+    }
     stages {
         stage('Get Code') {
             steps {
                 git 'https://github.com/ericmatamoros/unir-helloworld'
             }
         }
-
-        stage('Build') {
+        stage('Unit') {
             steps {
-                echo 'Eyyy, esto es Python. No hay que compilar nada!!!'
-                echo "${WORKSPACE}"
-                sh 'pwd'
-                sh 'ls -la'
-            }
-        }
-        
-        stage('Tests') {
-            parallel {
-            
-                stage('Unit') {
-                        steps {
-                            sh '''
-                                source ~/miniconda3/etc/profile.d/conda.sh
-                                conda activate unir
-            
-                                export PYTHONPATH=$WORKSPACE
-                                python -m pytest --junitxml=result-unit.xml test/unit
-                            '''
-                        }
-                }
-                stage('Service') {
-                    steps {
-                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                            sh '''
-                                source ~/miniconda3/etc/profile.d/conda.sh
-                                conda activate unir
-                
-                                export FLASK_APP=app/api.py
-                                export FLASK_ENV=development
-                                flask run &
-                
-                                export PYTHONPATH=$WORKSPACE
-                                python -m pytest --junitxml=result-rest.xml test/rest
-                            '''
-                        }
-                    }
-                }
-            }
-        }
-        stage('Results') {
-            steps {
+                sh '''
+                    export PYTHONPATH=$WORKSPACE
+                    coverage run --branch --source=app --omit=app/__init__.py,app/api.py -m pytest --junitxml=result-unit.xml test/unit
+                '''
                 junit 'result-unit.xml'
+            }
+        }
+        stage('Service') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+                    sh '''
+                        export FLASK_APP=app/api.py
+                        export FLASK_ENV=development
+                        flask run &
+                        export PYTHONPATH=$WORKSPACE
+                        python -m pytest --junitxml=result-rest.xml test/rest
+                    '''
+                }
+                junit 'result-rest.xml'
+            }
+        }
+        stage('Coverage') {
+            steps {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    sh 'coverage xml'
+                }
+                recordCoverage(
+                    tools: [[parser: 'COBERTURA', pattern: 'coverage.xml']],
+                    qualityGates: [
+                        [criticality: 'ERROR', integerThreshold: 85, metric: 'LINE', threshold: 85.0],
+                        [integerThreshold: 95, metric: 'LINE', threshold: 95.0],
+                        [criticality: 'ERROR', integerThreshold: 80, metric: 'BRANCH', threshold: 80.0],
+                        [integerThreshold: 90, metric: 'BRANCH', threshold: 90.0]
+                    ]
+                )
+            }
+        }
+        stage('Static') {
+            steps {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    sh 'flake8 --format=pylint app >flake8.out || true'
+                }
+                recordIssues(
+                    tools: [flake8(name: 'Flake8', pattern: 'flake8.out')],
+                    qualityGates: [
+                        [threshold: 8, type: 'TOTAL', unstable: true],
+                        [threshold: 10, type: 'TOTAL', unstable: false]
+                    ]
+                )
+            }
+        }
+        stage('Security') {
+            steps {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    sh 'bandit --exit-zero -r . -f custom -o bandit.out --msg-template "{abspath}:{line}: [{test_id}] {msg}"'
+                }
+                recordIssues(
+                    tools: [pyLint(name: 'Bandit', pattern: 'bandit.out')],
+                    qualityGates: [
+                        [threshold: 2, type: 'TOTAL', unstable: true],
+                        [threshold: 4, type: 'TOTAL', unstable: false]
+                    ]
+                )
+            }
+        }
+        stage('Performance') {
+            steps {
+                sh '''
+                    pkill -f "flask run" || true
+                    export FLASK_APP=app/api.py
+                    export FLASK_ENV=development
+                    python3 -m flask run &
+                    sleep 2
+                    /opt/homebrew/bin/jmeter -n -t test/jmeter/flask.jmx -f -l flask.jtl
+                '''
+                perfReport sourceDataFiles: 'flask.jtl'
             }
         }
     }
