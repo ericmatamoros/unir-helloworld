@@ -1,0 +1,196 @@
+pipeline {
+    agent none
+    
+    stages {
+        stage('Get Code') {
+            agent { label 'built-in' }
+            steps {
+                cleanWs()
+                sh '''
+                    echo "===== AGENTE: Get Code ====="
+                    whoami
+                    hostname
+                    pwd
+                '''
+                git 'https://github.com/ericmatamoros/unir-helloworld'
+                stash name: 'source-code', includes: '**/*'
+            }
+        }
+        
+        stage('Pruebas Paralelas') {
+            parallel {
+                stage('Unit + Coverage') {
+                    agent { label 'tests' }
+                    environment {
+                        PATH = "${HOME}/miniconda3/envs/unir/bin:${HOME}/miniconda3/condabin:${env.PATH}"
+                    }
+                    steps {
+                        cleanWs()
+                        unstash 'source-code'
+                        sh '''
+                            echo "===== AGENTE: Unit + Coverage ====="
+                            whoami
+                            hostname
+                            pwd
+                        '''
+                        sh '''
+                            export PYTHONPATH=$WORKSPACE
+                            coverage run --branch --source=app --omit=app/__init__.py,app/api.py -m pytest --junitxml=result-unit.xml test/unit
+                            coverage xml
+                        '''
+                        stash name: 'coverage-results', includes: 'coverage.xml,result-unit.xml'
+                    }
+                }
+                
+                stage('Static') {
+                    agent { label 'calidad' }
+                    environment {
+                        PATH = "${HOME}/miniconda3/envs/unir/bin:${HOME}/miniconda3/condabin:${env.PATH}"
+                    }
+                    steps {
+                        cleanWs()
+                        unstash 'source-code'
+                        sh '''
+                            echo "===== AGENTE: Static ====="
+                            whoami
+                            hostname
+                            pwd
+                        '''
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            sh 'flake8 --format=pylint app >flake8.out || true'
+                        }
+                        stash name: 'static-results', includes: 'flake8.out'
+                    }
+                }
+                
+                stage('Security') {
+                    agent { label 'calidad' }
+                    environment {
+                        PATH = "${HOME}/miniconda3/envs/unir/bin:${HOME}/miniconda3/condabin:${env.PATH}"
+                    }
+                    steps {
+                        cleanWs()
+                        unstash 'source-code'
+                        sh '''
+                            echo "===== AGENTE: Security ====="
+                            whoami
+                            hostname
+                            pwd
+                        '''
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            sh 'bandit --exit-zero -r . -f custom -o bandit.out --msg-template "{abspath}:{line}: [{test_id}] {msg}"'
+                        }
+                        stash name: 'security-results', includes: 'bandit.out'
+                    }
+                }
+                
+                stage('Service') {
+                    agent { label 'tests' }
+                    environment {
+                        PATH = "${HOME}/miniconda3/envs/unir/bin:${HOME}/miniconda3/condabin:${env.PATH}"
+                    }
+                    steps {
+                        cleanWs()
+                        unstash 'source-code'
+                        sh '''
+                            echo "===== AGENTE: Service ====="
+                            whoami
+                            hostname
+                            pwd
+                        '''
+                        catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+                            sh '''
+                                pkill -f "flask run" || true
+                                export FLASK_APP=app/api.py
+                                export FLASK_ENV=development
+                                flask run &
+                                sleep 2
+                                export PYTHONPATH=$WORKSPACE
+                                python -m pytest --junitxml=result-rest.xml test/rest
+                                pkill -f "flask run" || true
+                            '''
+                        }
+                        stash name: 'service-results', includes: 'result-rest.xml'
+                    }
+                }
+            }
+        }
+        
+        stage('Performance') {
+            agent { label 'calidad' }
+            environment {
+                PATH = "${HOME}/miniconda3/envs/unir/bin:${HOME}/miniconda3/condabin:${env.PATH}"
+            }
+            steps {
+                cleanWs()
+                unstash 'source-code'
+                sh '''
+                    echo "===== AGENTE: Performance ====="
+                    whoami
+                    hostname
+                    pwd
+                '''
+                sh '''
+                    pkill -f "flask run" || true
+                    export FLASK_APP=app/api.py
+                    export FLASK_ENV=development
+                    python3 -m flask run &
+                    sleep 2
+                    /opt/homebrew/bin/jmeter -n -t test/jmeter/flask.jmx -f -l flask.jtl
+                    pkill -f "flask run" || true
+                '''
+                stash name: 'performance-results', includes: 'flask.jtl'
+            }
+        }
+        
+        stage('Publicar Resultados') {
+            agent { label 'built-in' }
+            steps {
+                cleanWs()
+                sh '''
+                    echo "===== AGENTE: Publicar Resultados ====="
+                    whoami
+                    hostname
+                    pwd
+                '''
+                unstash 'source-code'
+                unstash 'coverage-results'
+                unstash 'static-results'
+                unstash 'security-results'
+                unstash 'service-results'
+                unstash 'performance-results'
+                
+                junit 'result-unit.xml'
+                junit 'result-rest.xml'
+                
+                recordCoverage(
+                    tools: [[parser: 'COBERTURA', pattern: 'coverage.xml']],
+                    qualityGates: [
+                        [criticality: 'ERROR', integerThreshold: 85, metric: 'LINE', threshold: 85.0],
+                        [integerThreshold: 95, metric: 'LINE', threshold: 95.0],
+                        [criticality: 'ERROR', integerThreshold: 80, metric: 'BRANCH', threshold: 80.0],
+                        [integerThreshold: 90, metric: 'BRANCH', threshold: 90.0]
+                    ]
+                )
+                
+                recordIssues(
+                    tools: [flake8(name: 'Flake8', pattern: 'flake8.out')],
+                    qualityGates: [
+                        [threshold: 8, type: 'TOTAL', unstable: true],
+                        [threshold: 10, type: 'TOTAL', unstable: false]
+                    ]
+                )
+                
+                recordIssues(
+                    tools: [pyLint(name: 'Bandit', pattern: 'bandit.out')],
+                    qualityGates: [
+                        [threshold: 2, type: 'TOTAL', unstable: true],
+                        [threshold: 4, type: 'TOTAL', unstable: false]
+                    ]
+                )
+                
+                perfReport sourceDataFiles: 'flask.jtl'
+            }
+        }
+    }
+}
